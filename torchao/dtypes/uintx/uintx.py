@@ -183,6 +183,37 @@ def _(func, types, args, kwargs):
         func, args, kwargs, args[0].apply_transformation(lambda x: (x * args[1]).to(torch.uint8))
     )
 
+def fill_defaults(args, n, defaults_tail):
+    """
+    __torch_dispatch__ doesn't guarantee the number of arguments you are
+    passed (e.g., defaulted arguments are not passed); but usually it is
+    convenient to pad out the arguments list with defaults.  This function
+    helps you do that.
+    Args:
+        args: the list of positional arguments passed to __torch_dispatch__
+        n: the number of arguments you are expecting to get
+        defaults_tail: default values for the arguments, starting from the
+            end of the list
+    Example:
+        >>> fill_defaults([1, 2, 3], 5, [3, 4, 5])
+        [1, 2, 3, 4, 5]
+        >>> fill_defaults([1, 2, 3], 5, [None, None, None])
+        [1, 2, 3, None, None]]
+    """
+    if n - len(defaults_tail) > len(args):
+        raise RuntimeError("not enough defaults to fill arguments")
+    r = list(args)
+    for i in range(len(args), n):
+        r.append(defaults_tail[i - n + len(defaults_tail)])
+    return r
+
+@implements(aten.slice.Tensor)
+def _(func, types, args, kwargs):
+    args = fill_defaults(args, 5, [None, None, None, None])
+    return return_and_correct_aliasing(
+        func, args, kwargs, args[0].apply_transformation(lambda x: x[args[1]:args[2]:args[3]])
+    )
+
 # quantization api integrations
 to_uintx = UintxTensor.from_uint8
 
@@ -198,7 +229,7 @@ class UintxLayoutType(LayoutType):
 class UintxAQTLayout(PlainAQTLayout):
 
     def get_plain(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.int_data.get_plain(), self.scale, self.zero_point
+        return self.int_data, self.scale, self.zero_point
 
     @classmethod
     def from_plain(
