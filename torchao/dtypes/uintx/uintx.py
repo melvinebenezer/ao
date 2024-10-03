@@ -55,6 +55,7 @@ class UintxTensor(TorchAOBaseTensor):
     def __new__(
         cls,
         shards: List[torch.Tensor],
+        original_size: int,
         packed_shape: List[int],
         bit_width: int,
         pack_dim: int = -1,
@@ -69,6 +70,7 @@ class UintxTensor(TorchAOBaseTensor):
     def __init__(
         self,
         shards: List[torch.Tensor],
+        original_size: int,
         packed_shape: List[int],
         bit_width: int,
         pack_dim: int = -1,
@@ -79,6 +81,7 @@ class UintxTensor(TorchAOBaseTensor):
         self.packed_shape = packed_shape
         self.bit_width = bit_width
         self.pack_dim = pack_dim
+        self.original_size = original_size
 
     def get_shards(self):
         return [getattr(self,i) for i in self.__class__.bits_to_shard[self.bit_width]]
@@ -98,7 +101,7 @@ class UintxTensor(TorchAOBaseTensor):
         return cls(shards, packed_shape, bit_width, pack_dim)
 
     def get_plain(self):
-        return unpack(self.get_shards(), self.bit_width, dim = self.pack_dim)
+        return unpack(self.get_shards(), original_size=self.original_size, elem_size=self.bit_width, dim = self.pack_dim)
 
     # temporary until kernels on packed tensors are created
     def apply_transformation(self, fn):
@@ -116,10 +119,10 @@ class UintxTensor(TorchAOBaseTensor):
     def from_uint8(cls, int_data: torch.Tensor, dtype: torch.dtype, pack_dim: int = -1):
         assert dtype in _DTYPE_TO_BIT_WIDTH.keys(), "Expected dtype to be one of {_DTYPE_TO_BIT_WIDTH.keys()}"
         bit_width = _DTYPE_TO_BIT_WIDTH[dtype]
-        shards = pack(int_data, bit_width, dim=pack_dim)
+        shards, original_size = pack(int_data, bit_width, dim=pack_dim)
         shape = list(int_data.shape)
         shape[pack_dim] = shape[pack_dim] * bit_width // 8
-        return cls(shards, int_data.shape, bit_width, pack_dim)
+        return cls(shards, original_size, int_data.shape, bit_width, pack_dim)
 
 
     def _get_to_kwargs(self, *args, **kwargs):
@@ -207,12 +210,45 @@ def fill_defaults(args, n, defaults_tail):
         r.append(defaults_tail[i - n + len(defaults_tail)])
     return r
 
+
 @implements(aten.slice.Tensor)
 def _(func, types, args, kwargs):
-    args = fill_defaults(args, 5, [None, None, None, None])
+    self, dim, start, end, step = fill_defaults(args, 5, [0, None, None, 1])
+    # assert step == 1
+    if end >= self.shape[dim]:
+        end = self.shape[dim]
+    shape = list(self.shape)
+    shape[dim] = end - start
+    
+    def slice_fn(x):
+        return torch.ops.aten.slice.Tensor(x, dim, start, end, step)
+        # return self.__class__(aten.slice.Tensor(self.layout_tensor, dim, start, end, step), shape, self.dtype)
+
     return return_and_correct_aliasing(
-        func, args, kwargs, args[0].apply_transformation(lambda x: x[args[1]:args[2]:args[3]])
+        func, args, kwargs, self.apply_transformation(slice_fn)
     )
+
+# @implements(aten.slice.Tensor)
+# def _(func, types, args, kwargs):
+#     args_ = fill_defaults(args, 5, [None, None, None, 1])
+#     tensor, dim, start, end, step = args_
+    
+#     # Handle default values
+#     if dim is None:
+#         dim = 0
+#     if start is None:
+#         start = 0
+#     if end is None:
+#         end = 9223372036854775807  # This is 2^63 - 1, used as "end" in PyTorch
+#     if step is None:
+#         step = 1
+
+#     def slice_fn(x):
+#         return torch.ops.aten.slice.Tensor(x, dim, start, end, step)
+
+#     return return_and_correct_aliasing(
+#         func, args, kwargs, tensor.apply_transformation(slice_fn)
+#     )
 
 # quantization api integrations
 to_uintx = UintxTensor.from_uint8
